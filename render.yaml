@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: progress-tracker
+    runtime: python
+    buildCommand: pip install -r requirements.render.txt
+    startCommand: gunicorn app:app
+    healthCheckPath: /
+    envVars:
+      - key: TRACKER_TIMEZONE
+        value: Asia/Kolkata
