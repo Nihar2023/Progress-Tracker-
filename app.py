@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import calendar
 import io
 import json
 import os
@@ -24,6 +25,11 @@ app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
 
 def today() -> date:
     return datetime.now(TIMEZONE).date()
+
+
+def minutes_from_hours(hours: float) -> int:
+    """Convert the legacy on-disk hour value to the app's minute display unit."""
+    return round(hours * 60)
 
 
 def connection() -> sqlite3.Connection:
@@ -85,7 +91,8 @@ def day_payload(con: sqlite3.Connection, log_date: str) -> dict:
         "reflection": log["reflection"] if log else "",
         "locked": bool(log["locked"]) if log else log_date < today().isoformat(),
         "total_hours": round(sum(task["hours"] for task in tasks), 2),
-        "tasks": [dict(task) for task in tasks],
+        "total_minutes": minutes_from_hours(sum(task["hours"] for task in tasks)),
+        "tasks": [{**dict(task), "minutes": minutes_from_hours(task["hours"])} for task in tasks],
     }
 
 
@@ -147,13 +154,13 @@ def add_task():
     name = str(data.get("name", "")).strip()
     description = str(data.get("description", "")).strip()
     try:
-        hours = float(data.get("hours"))
+        minutes = float(data.get("minutes"))
     except (TypeError, ValueError):
-        return validation_error("Hours must be a number.")
+        return validation_error("Minutes must be a number.")
     if not name or len(name) > 160:
         return validation_error("Task name is required and must be 160 characters or fewer.")
-    if not 0 < hours <= 24:
-        return validation_error("Hours must be greater than 0 and no more than 24.")
+    if not 0 < minutes <= 1440:
+        return validation_error("Minutes must be greater than 0 and no more than 1,440.")
     if len(description) > 3000:
         return validation_error("Description must be 3,000 characters or fewer.")
     with connection() as con:
@@ -161,7 +168,7 @@ def add_task():
         if not allowed:
             return validation_error(message, 403)
         con.execute("INSERT INTO tasks (log_date, name, hours, description) VALUES (?, ?, ?, ?)",
-                    (today().isoformat(), name, hours, description))
+                    (today().isoformat(), name, minutes / 60, description))
         con.execute("UPDATE daily_logs SET updated_at = CURRENT_TIMESTAMP WHERE log_date = ?", (today().isoformat(),))
         return jsonify(day_payload(con, today().isoformat())), 201
 
@@ -172,11 +179,11 @@ def update_task(task_id: int):
     name = str(data.get("name", "")).strip()
     description = str(data.get("description", "")).strip()
     try:
-        hours = float(data.get("hours"))
+        minutes = float(data.get("minutes"))
     except (TypeError, ValueError):
-        return validation_error("Hours must be a number.")
-    if not name or len(name) > 160 or not 0 < hours <= 24 or len(description) > 3000:
-        return validation_error("Please provide a valid name, hours (0–24), and description.")
+        return validation_error("Minutes must be a number.")
+    if not name or len(name) > 160 or not 0 < minutes <= 1440 or len(description) > 3000:
+        return validation_error("Please provide a valid name, minutes (1–1,440), and description.")
     with connection() as con:
         task = con.execute("SELECT log_date FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if not task:
@@ -185,7 +192,7 @@ def update_task(task_id: int):
         if not allowed:
             return validation_error(message, 403)
         con.execute("UPDATE tasks SET name=?, hours=?, description=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (name, hours, description, task_id))
+                    (name, minutes / 60, description, task_id))
         return jsonify(day_payload(con, task["log_date"]))
 
 
@@ -249,6 +256,128 @@ def stats():
         "productive_month": {"month": best_month[0], "hours": round(best_month[1], 2)} if best_month else None})
 
 
+@app.get("/api/progress")
+def progress():
+    """Return one complete, historic analytics period using only saved tasks."""
+    period = request.args.get("period", "week")
+    offset = request.args.get("offset", 0, type=int)
+    if period not in {"week", "month", "year"}:
+        return validation_error("Choose week, month, or year.")
+    if offset is None or offset < 0 or offset > 5200:
+        return validation_error("Choose a valid previous period.")
+
+    current = today()
+    def shift_month(value: date, months: int) -> date:
+        index = value.year * 12 + value.month - 1 - months
+        return date(index // 12, index % 12 + 1, 1)
+
+    if period == "week":
+        start = current - timedelta(days=current.weekday() + 7 * offset)
+        end = start + timedelta(days=6)
+        buckets = [start + timedelta(days=index) for index in range(7)]
+        title = f"{start.strftime('%d %b')} – {end.strftime('%d %b %Y')}"
+    elif period == "month":
+        start = shift_month(current.replace(day=1), offset)
+        end = date(start.year, start.month, calendar.monthrange(start.year, start.month)[1])
+        buckets = [start + timedelta(days=index) for index in range((end - start).days + 1)]
+        title = start.strftime("%B %Y")
+    else:
+        start = date(current.year - offset, 1, 1)
+        end = date(start.year, 12, 31)
+        buckets = [date(start.year, month, 1) for month in range(1, 13)]
+        title = str(start.year)
+
+    with connection() as con:
+        task_rows = con.execute("""
+            SELECT log_date, hours FROM tasks
+            WHERE log_date BETWEEN ? AND ?
+        """, (start.isoformat(), min(end, current).isoformat())).fetchall()
+        earliest = con.execute("SELECT MIN(log_date) first_date FROM daily_logs").fetchone()["first_date"]
+        history = con.execute("SELECT log_date, hours FROM tasks ORDER BY log_date").fetchall()
+
+    values = [0.0] * len(buckets)
+    sessions = [0] * len(buckets)
+    keys = ({item.isoformat(): index for index, item in enumerate(buckets)} if period != "year"
+            else {item.month: index for index, item in enumerate(buckets)})
+    for row in task_rows:
+        logged = date.fromisoformat(row["log_date"])
+        key = logged.isoformat() if period != "year" else logged.month
+        index = keys[key]
+        values[index] += float(row["hours"])
+        sessions[index] += 1
+
+    cutoff = min(end, current)
+    points = []
+    for item, hours, count in zip(buckets, values, sessions):
+        if period == "year":
+            bucket_end = date(item.year, item.month, calendar.monthrange(item.year, item.month)[1])
+            visible_days = max(0, (min(bucket_end, cutoff) - item).days + 1)
+            item_date = item
+            label, secondary = item.strftime("%b"), item.strftime("%Y")
+        else:
+            visible_days = 0 if item > cutoff else 1
+            item_date = item
+            label = item.strftime("%a") if period == "week" else str(item.day)
+            secondary = f"{item.day} {item.strftime('%b')}" if period == "week" else item.strftime("%b")
+        points.append({"date": item_date.isoformat(), "label": label, "secondary": secondary,
+                       "hours": round(hours, 2), "sessions": count,
+                       "average_session": round(hours / count, 2) if count else 0,
+                       "is_today": item_date == current if period != "year" else item.month == current.month and item.year == current.year,
+                       "is_future": visible_days == 0})
+
+    period_values = [point["hours"] for point in points if not point["is_future"]]
+    total = round(sum(period_values), 2)
+    active = sum(value > 0 for value in period_values)
+    day_count = max(1, sum(1 for point in points if not point["is_future"]))
+    total_sessions = sum(sessions)
+    previous_start = start - (end - start + timedelta(days=1))
+    previous_end = start - timedelta(days=1)
+    previous_total = sum(float(row["hours"]) for row in history
+                         if previous_start <= date.fromisoformat(row["log_date"]) <= previous_end)
+    change = round(((total - previous_total) / previous_total * 100), 1) if previous_total else None
+
+    daily_totals: dict[date, float] = {}
+    month_totals: Counter[str] = Counter()
+    week_totals: Counter[str] = Counter()
+    weekday_totals: Counter[int] = Counter()
+    weekday_counts: Counter[int] = Counter()
+    longest_session = 0.0
+    for row in history:
+        logged, hours = date.fromisoformat(row["log_date"]), float(row["hours"])
+        daily_totals[logged] = daily_totals.get(logged, 0) + hours
+        month_totals[logged.strftime("%Y-%m")] += hours
+        monday = logged - timedelta(days=logged.weekday())
+        week_totals[monday.isoformat()] += hours
+        weekday_totals[logged.weekday()] += hours
+        weekday_counts[logged.weekday()] += 1
+        longest_session = max(longest_session, hours)
+    best_day = max(daily_totals.items(), key=lambda item: item[1], default=None)
+    best_week = max(week_totals.items(), key=lambda item: item[1], default=None)
+    best_month = max(month_totals.items(), key=lambda item: item[1], default=None)
+    productive_weekday = max(weekday_totals, key=weekday_totals.get) if weekday_totals else None
+    dates_with_work = set(daily_totals)
+    streak = 0
+    cursor = current
+    while cursor in dates_with_work:
+        streak += 1
+        cursor -= timedelta(days=1)
+    achievements = [threshold for threshold in (50, 100, 250, 500) if sum(daily_totals.values()) >= threshold]
+    has_more = bool(earliest and start > date.fromisoformat(earliest))
+    return jsonify({
+        "period": period, "offset": offset, "title": title, "start": start.isoformat(), "end": end.isoformat(),
+        "points": points, "has_more": has_more, "total_hours": total, "active_periods": active,
+        "average_hours": round(total / day_count, 2), "inactive_periods": max(0, day_count - active),
+        "total_sessions": total_sessions, "average_session": round(total / total_sessions, 2) if total_sessions else 0,
+        "comparison": {"percent": change, "previous_hours": round(previous_total, 2)},
+        "insights": {"current_streak": streak, "longest_day": {"date": best_day[0].isoformat(), "hours": round(best_day[1], 2)} if best_day else None,
+                     "best_week": {"date": best_week[0], "hours": round(best_week[1], 2)} if best_week else None,
+                     "best_month": {"month": best_month[0], "hours": round(best_month[1], 2)} if best_month else None,
+                     "longest_session": round(longest_session, 2),
+                     "productive_weekday": calendar.day_name[productive_weekday] if productive_weekday is not None else None,
+                     "achievements": achievements}
+    })
+
+
 @app.get("/api/search")
 def search():
     query = request.args.get("q", "").strip()
@@ -257,7 +386,7 @@ def search():
     with connection() as con:
         rows = con.execute("SELECT * FROM tasks WHERE name LIKE ? OR description LIKE ? ORDER BY log_date DESC, id DESC LIMIT 100",
                            (f"%{query}%", f"%{query}%")).fetchall()
-    return jsonify([dict(r) for r in rows])
+    return jsonify([{**dict(row), "minutes": minutes_from_hours(row["hours"])} for row in rows])
 
 
 @app.get("/api/report/<month>")
