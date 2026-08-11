@@ -1,0 +1,15 @@
+/* Dark-theme overrides for the Backup settings panel. */
+.settings-panel select,.backup-path-input{background:#333;border-color:#4a4a4a}
+.backup-path-input input{background:#333;color:#eee}
+.backup-cloud-icon{background:#303030;border-color:#5a4524;color:#ffa116}
+.backup-frequency-options{background:#333;border-color:#4a4a4a}
+.backup-frequency-options button.active{background:#573b0f;color:#ffb640}
+.backup-schedule-choice{background:#303030;border-color:#454545}
+.backup-choice-field input,.backup-choice-field select{background:#333!important;border-color:#4a4a4a!important;color:#eee!important}
+.backup-now{background:#333;border-color:#ffa116;color:#ffb640}
+.backup-now:hover{background:#463718}
+.backup-status-card{background:#303830;border-color:#48634c}
+.backup-status-card[data-state="failed"]{background:#493323;border-color:#6f4636}
+.backup-status-card[data-state="uploading"]{background:#493e24;border-color:#705d31}
+.backup-safe-note{background:#303030;border-color:#444}
+.backup-safe-note strong{color:#eee}

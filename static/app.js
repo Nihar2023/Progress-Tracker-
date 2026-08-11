@@ -2,13 +2,24 @@ const $ = selector => document.querySelector(selector);
 const today = window.TRACKER_TODAY;
 let editing = null;
 let timerStart = null;
+let timerElapsed = 0;
 let timerTick = null;
+const TIMER_SETTINGS_KEY = 'progress-timer-settings';
+let timerSettings = loadTimerSettings();
+let soundPreview = null;
+let previewSongId = null;
+let previewTimeout = null;
+let previewObjectUrl = null;
+let alarmAudio = null;
+let alarmContext = null;
+let alarmTimeout = null;
 const progressCharts = new Map();
 const progressPanels = new Map();
 let analyticsPeriod = 'week';
 let analyticsOldestOffset = 0;
 let analyticsLoading = false;
 document.head.insertAdjacentHTML('beforeend', '<style>.analytics-summary,.analytics-insights{display:none}</style>');
+document.head.insertAdjacentHTML('beforeend', '<link rel="stylesheet" href="/static/backup-theme.css">');
 
 const fmt = hours => {
   const totalMinutes = Math.round(Number(hours || 0) * 60);
@@ -145,19 +156,223 @@ $('#restore').onchange = async event => {
   const form = new FormData(); form.append('backup', event.target.files[0]);
   try { await fetchJSON('/restore', { method: 'POST', body: form }); toast('Backup restored. Reloading…'); setTimeout(() => location.reload(), 700); } catch (error) { toast(error.message); }
 };
-function updateTimer() {
-  if (!timerStart) return;
-  const seconds = Math.floor((Date.now() - timerStart) / 1000);
-  $('#timer-display').textContent = `${String(Math.floor(seconds / 3600)).padStart(2, '0')}:${String(Math.floor(seconds % 3600 / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+function loadTimerSettings() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(TIMER_SETTINGS_KEY) || '{}');
+    const songs = Array.isArray(saved.songs) ? saved.songs : (saved.soundData ? [{ id: 'saved-alarm-sound', name: saved.soundName || 'Saved alarm sound', data: saved.soundData }] : []);
+    return { songs, selectedSoundId: saved.selectedSoundId || songs[0]?.id || null, countdown: { duration: 3600, remaining: 3600, startedAt: null, running: false }, ...saved, songs, selectedSoundId: saved.selectedSoundId || songs[0]?.id || null, countdown: { duration: 3600, remaining: 3600, startedAt: null, running: false, ...(saved.countdown || {}) } };
+  } catch (_) { return { songs: [], selectedSoundId: null, countdown: { duration: 3600, remaining: 3600, startedAt: null, running: false } }; }
 }
-$('#timer-open').onclick = () => $('#timer-dialog').showModal();
-$('#timer-start').onclick = () => { if (!$('#timer-name').value.trim()) return toast('Name the task first.'); timerStart = Date.now(); clearInterval(timerTick); timerTick = setInterval(updateTimer, 1000); toast('Timer started.'); };
-$('#timer-stop').onclick = () => {
-  if (!timerStart) return;
-  const minutes = Math.max(1, Math.round((Date.now() - timerStart) / 60000));
-  $('#task-name').value = $('#timer-name').value; $('#task-minutes').value = minutes; $('#task-desc').value = `Timer: ${$('#timer-display').textContent}`;
-  timerStart = null; clearInterval(timerTick); $('#timer-dialog').close(); toast('Timer duration added to the form. Save it when ready.');
-};
+function saveTimerSettings() { localStorage.setItem(TIMER_SETTINGS_KEY, JSON.stringify(timerSettings)); }
+function formatTimer(seconds) {
+  const value = Math.max(0, Math.floor(seconds));
+  return `${String(Math.floor(value / 3600)).padStart(2, '0')}:${String(Math.floor(value % 3600 / 60)).padStart(2, '0')}:${String(value % 60).padStart(2, '0')}`;
+}
+function focusSeconds() { return timerElapsed + (timerStart ? (Date.now() - timerStart) / 1000 : 0); }
+function countdownSeconds() {
+  const timer = timerSettings.countdown;
+  return timer.running && timer.startedAt ? Math.max(0, timer.remaining - (Date.now() - timer.startedAt) / 1000) : timer.remaining;
+}
+function renderFocusTimer() {
+  const seconds = focusSeconds();
+  $('#timer-display').textContent = formatTimer(seconds);
+  $('#timer-start').disabled = Boolean(timerStart) || seconds > 0;
+  $('#timer-start').textContent = seconds > 0 ? 'In progress' : 'Start';
+  $('#timer-pause').disabled = !timerStart && seconds === 0;
+  $('#timer-pause').textContent = timerStart ? 'Pause' : 'Resume';
+  $('#timer-stop').disabled = seconds === 0;
+}
+function renderCountdownTimer() {
+  const seconds = countdownSeconds();
+  $('#countdown-display').textContent = formatTimer(seconds);
+  $('#countdown-start').disabled = timerSettings.countdown.running || seconds === 0;
+  $('#countdown-start').textContent = seconds < timerSettings.countdown.duration && !timerSettings.countdown.running ? 'Resume' : 'Start';
+  $('#countdown-pause').disabled = !timerSettings.countdown.running && seconds === timerSettings.countdown.duration;
+  $('#countdown-pause').textContent = timerSettings.countdown.running ? 'Pause' : 'Resume';
+}
+function updateTimer() {
+  if (timerStart) renderFocusTimer();
+  if (timerSettings.countdown.running) {
+    if (countdownSeconds() <= 0) {
+      timerSettings.countdown.running = false; timerSettings.countdown.startedAt = null; timerSettings.countdown.remaining = 0; saveTimerSettings(); renderCountdownTimer(); playAlarmSound(); toast('Timer finished.');
+    } else renderCountdownTimer();
+  }
+}
+function persistCountdown() {
+  if (timerSettings.countdown.running) { timerSettings.countdown.remaining = countdownSeconds(); timerSettings.countdown.startedAt = Date.now(); saveTimerSettings(); }
+}
+function setCountdownFromInputs() {
+  const hours = Math.min(99, Math.max(0, Number($('#countdown-hours').value) || 0));
+  const minutes = Math.min(59, Math.max(0, Number($('#countdown-minutes').value) || 0));
+  const seconds = Math.min(59, Math.max(0, Number($('#countdown-seconds').value) || 0));
+  const total = hours * 3600 + minutes * 60 + seconds;
+  timerSettings.countdown = { duration: total, remaining: total, startedAt: null, running: false }; saveTimerSettings(); renderCountdownTimer();
+}
+function updatePreviewButton(playing) {
+  const button = $('#preview-alarm-sound');
+  button.textContent = playing ? '❚❚' : '▶';
+  button.setAttribute('aria-label', playing ? 'Stop alarm sound preview' : 'Play selected alarm sound');
+}
+function stopPreview() {
+  clearTimeout(previewTimeout); previewTimeout = null;
+  if (soundPreview) { soundPreview.pause(); soundPreview.currentTime = 0; soundPreview = null; }
+  previewSongId = null;
+  if (previewObjectUrl) { URL.revokeObjectURL(previewObjectUrl); previewObjectUrl = null; }
+  updatePreviewButton(false);
+  renderAlarmSetting();
+}
+function playForThirtySeconds(source, songId = null) {
+  stopPreview();
+  previewObjectUrl = source.startsWith('blob:') ? source : null;
+  const audio = new Audio(source); soundPreview = audio;
+  previewSongId = songId;
+  audio.play().catch(() => toast('Audio preview could not start.'));
+  updatePreviewButton(songId === null);
+  renderAlarmSetting();
+  previewTimeout = setTimeout(stopPreview, 30000);
+  audio.addEventListener('timeupdate', () => { if (audio.currentTime >= 30) stopPreview(); });
+  audio.addEventListener('ended', () => { if (soundPreview === audio) stopPreview(); });
+}
+function setAlarmStopVisible(visible) { $('#countdown-stop-alarm').hidden = !visible; }
+function stopAlarmSound() {
+  clearTimeout(alarmTimeout); alarmTimeout = null;
+  if (alarmAudio) { alarmAudio.pause(); alarmAudio.currentTime = 0; alarmAudio = null; }
+  if (alarmContext) { alarmContext.close().catch(() => {}); alarmContext = null; }
+  setAlarmStopVisible(false);
+}
+function playBuiltInAlarm() {
+  const AudioContext = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContext) return;
+  const context = new AudioContext(); alarmContext = context; setAlarmStopVisible(true);
+  [523, 659, 784].forEach((frequency, index) => {
+    const oscillator = context.createOscillator(); const gain = context.createGain(); const start = context.currentTime + index * .25;
+    oscillator.frequency.value = frequency; gain.gain.setValueAtTime(.0001, start); gain.gain.exponentialRampToValueAtTime(.18, start + .02); gain.gain.exponentialRampToValueAtTime(.0001, start + .45);
+    oscillator.connect(gain).connect(context.destination); oscillator.start(start); oscillator.stop(start + .48);
+  });
+  alarmTimeout = setTimeout(stopAlarmSound, 1300);
+}
+function selectedAlarmSong() { return timerSettings.songs.find(song => song.id === timerSettings.selectedSoundId); }
+function playAlarmSound() {
+  stopAlarmSound();
+  const song = selectedAlarmSong();
+  if (song) {
+    const audio = new Audio(song.data); alarmAudio = audio; setAlarmStopVisible(true);
+    audio.play().catch(() => { alarmAudio = null; playBuiltInAlarm(); });
+    audio.addEventListener('ended', () => { if (alarmAudio === audio) stopAlarmSound(); });
+  } else playBuiltInAlarm();
+}
+function renderAlarmSetting() {
+  const selected = selectedAlarmSong();
+  $('#alarm-sound-status').textContent = selected ? 'Alarm sound: ' + selected.name : 'Using the built-in alarm sound.';
+  $('#alarm-song-list').innerHTML = timerSettings.songs.length ? timerSettings.songs.map(song => {
+    const previewing = previewSongId === song.id && soundPreview;
+    const chosen = song.id === timerSettings.selectedSoundId;
+    return '<div class="alarm-song' + (chosen ? ' selected' : '') + '"><button class="mini song-preview" type="button" data-song-preview="' + song.id + '" aria-label="' + (previewing ? 'Stop' : 'Preview') + ' ' + escapeHtml(song.name) + '">' + (previewing ? '❚❚' : '▶') + '</button><span>' + escapeHtml(song.name) + '</span><button class="song-select" type="button" data-song-select="' + song.id + '" aria-label="' + (chosen ? 'Selected alarm sound' : 'Set as alarm sound') + '" aria-pressed="' + chosen + '">' + (chosen ? '■' : '□') + '</button></div>';
+  }).join('') : '<p class="empty-sounds">Add MP3 or WAV files to build your sound library.</p>';
+}
+
+function formatBackupSize(bytes) {
+  if (!Number.isFinite(Number(bytes))) return '';
+  const value = Number(bytes);
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+function installBackupSettings() {
+  const dialog = $('#settings-dialog');
+  const close = dialog.querySelector('.close');
+  const title = $('#settings-title');
+  const alarmPanel = document.createElement('section');
+  alarmPanel.className = 'settings-panel'; alarmPanel.dataset.settingsPanel = 'alarm';
+  [...dialog.children].filter(element => element !== close && element !== title).forEach(element => alarmPanel.append(element));
+  const tabs = document.createElement('div');
+  tabs.className = 'settings-tabs'; tabs.setAttribute('role', 'tablist'); tabs.setAttribute('aria-label', 'Settings sections');
+  tabs.innerHTML = '<button class="settings-tab active" type="button" data-settings-tab="alarm" role="tab" aria-selected="true">Alarm</button><button class="settings-tab" type="button" data-settings-tab="backup" role="tab" aria-selected="false">Backup</button>';
+  const days = Array.from({ length: 28 }, (_, index) => `<option value="${index + 1}">${index + 1}</option>`).join('');
+  const backupPanel = document.createElement('section');
+  backupPanel.className = 'settings-panel'; backupPanel.dataset.settingsPanel = 'backup'; backupPanel.hidden = true;
+  backupPanel.innerHTML = `<div class="backup-hero"><div class="backup-cloud-icon" aria-hidden="true">↑</div><h3>Auto Backup</h3><p>Keep a safe copy of your progress in a Google Drive folder.</p></div><form id="backup-settings-form"><section class="backup-group"><h3>Backup Folder Path</h3><label class="sr-only" for="backup-folder">Google Drive backup folder</label><div class="backup-path-input"><span aria-hidden="true">▣</span><input id="backup-folder" type="text" placeholder="G:\\My Drive\\Progress Tracker Backups" autocomplete="off"></div><p class="field-hint">Choose a folder inside Google Drive for desktop where backups will be saved.</p></section><section class="backup-group"><h3>Backup Frequency</h3><input id="backup-frequency" type="hidden" value="manual"><div class="backup-frequency-options" role="radiogroup" aria-label="Backup frequency"><button type="button" data-backup-frequency="daily" role="radio" aria-checked="false">Daily</button><button type="button" data-backup-frequency="weekly" role="radio" aria-checked="false">Weekly</button><button type="button" data-backup-frequency="monthly" role="radio" aria-checked="false">Monthly</button></div><div class="backup-schedule-choice" id="backup-schedule-choice" hidden><div class="backup-choice-field" id="backup-time-field"><label for="backup-time">Time of day</label><input id="backup-time" type="time" value="03:00"><p class="field-hint">Select the time when the backup should run.</p></div><div class="backup-choice-field" id="backup-weekday-field" hidden><label for="backup-weekday">Day of week</label><select id="backup-weekday"><option value="MON">Monday</option><option value="TUE">Tuesday</option><option value="WED">Wednesday</option><option value="THU">Thursday</option><option value="FRI">Friday</option><option value="SAT">Saturday</option><option value="SUN">Sunday</option></select><p class="field-hint">Select the day when the backup should run each week.</p></div><div class="backup-choice-field" id="backup-month-day-field" hidden><label for="backup-month-day">Date of month</label><select id="backup-month-day">${days}</select><p class="field-hint">Select a date from 1 to 28 for your monthly backup.</p></div></div><p class="field-hint backup-frequency-hint" id="backup-frequency-hint">Choose how often you want automatic backups.</p></section><section class="backup-actions"><div><h3>Save Auto Backup Settings</h3><p>Save your backup schedule settings.</p></div><button class="primary" type="submit" id="save-backup-settings">Save Schedule</button></section></form><section class="backup-actions backup-now-action"><div><h3>Back Up Now</h3><p>Create a backup immediately.</p></div><button class="ghost backup-now" type="button" id="backup-now">Back Up Now</button></section><div class="backup-status-card" id="backup-status" aria-live="polite"><strong>Backup not configured</strong><span>Choose a Google Drive folder to begin.</span></div><div class="backup-safe-note"><span aria-hidden="true">◈</span><div><strong>Your data is safe</strong><p>Your backups can be restored whenever you need them.</p></div></div>`;
+  title.textContent = 'Settings'; title.after(tabs); tabs.after(alarmPanel); alarmPanel.after(backupPanel);
+  tabs.onclick = event => {
+    const button = event.target.closest('[data-settings-tab]'); if (!button) return;
+    document.querySelectorAll('[data-settings-tab]').forEach(item => { const active = item === button; item.classList.toggle('active', active); item.setAttribute('aria-selected', String(active)); });
+    document.querySelectorAll('[data-settings-panel]').forEach(panel => { panel.hidden = panel.dataset.settingsPanel !== button.dataset.settingsTab; });
+    title.textContent = button.dataset.settingsTab === 'backup' ? 'Backup' : 'Alarm settings';
+  };
+  document.querySelectorAll('[data-backup-frequency]').forEach(button => button.onclick = () => { $('#backup-frequency').value = button.dataset.backupFrequency; updateBackupScheduleFields(); });
+  $('#backup-settings-form').onsubmit = saveBackupSettings;
+  $('#backup-now').onclick = runBackupNow;
+}
+function updateBackupScheduleFields() {
+  const frequency = $('#backup-frequency').value;
+  $('#backup-schedule-choice').hidden = !['daily', 'weekly', 'monthly'].includes(frequency);
+  $('#backup-time-field').hidden = frequency !== 'daily';
+  $('#backup-weekday-field').hidden = frequency !== 'weekly';
+  $('#backup-month-day-field').hidden = frequency !== 'monthly';
+  document.querySelectorAll('[data-backup-frequency]').forEach(button => { const active = button.dataset.backupFrequency === frequency; button.classList.toggle('active', active); button.setAttribute('aria-checked', String(active)); });
+  $('#backup-frequency-hint').hidden = frequency !== 'manual';
+}
+function renderBackupStatus(status = {}) {
+  const card = $('#backup-status');
+  const labels = { not_configured: 'Backup not configured', ready: 'Manual backup ready', scheduled: 'Automatic backup scheduled', uploading: 'Preparing backup…', complete: 'Backup complete', failed: 'Backup failed' };
+  card.dataset.state = status.state || 'not_configured';
+  const size = formatBackupSize(status.size_bytes);
+  const when = status.updated_at ? new Date(status.updated_at).toLocaleString() : '';
+  const details = [status.message, status.file_name, size, when].filter(Boolean).join(' · ');
+  card.innerHTML = `<strong>${labels[status.state] || 'Backup status'}</strong><span>${escapeHtml(details || 'Choose a Google Drive folder to begin.')}</span>`;
+}
+function renderBackupSettings(data) {
+  const settings = data.settings || {};
+  $('#backup-folder').value = settings.folder || '';
+  $('#backup-frequency').value = settings.frequency || 'manual';
+  $('#backup-time').value = settings.time || '03:00';
+  $('#backup-weekday').value = settings.weekday || 'SUN';
+  $('#backup-month-day').value = String(settings.month_day || 1);
+  updateBackupScheduleFields(); renderBackupStatus(data.status);
+}
+async function loadBackupSettings() {
+  try { renderBackupSettings(await fetchJSON('/api/settings/backup')); }
+  catch (error) { renderBackupStatus({ state: 'failed', message: error.message }); }
+}
+async function saveBackupSettings(event) {
+  event.preventDefault();
+  const button = $('#save-backup-settings'); button.disabled = true;
+  try {
+    const data = await fetchJSON('/api/settings/backup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ folder: $('#backup-folder').value.trim(), frequency: $('#backup-frequency').value, time: $('#backup-time').value, weekday: $('#backup-weekday').value, month_day: $('#backup-month-day').value }) });
+    renderBackupSettings(data); toast(data.settings.frequency === 'manual' ? 'Automatic backup is off. You can still back up now.' : 'Backup schedule saved.');
+  } catch (error) { toast(error.message); } finally { button.disabled = false; }
+}
+async function runBackupNow() {
+  const button = $('#backup-now'); button.disabled = true;
+  renderBackupStatus({ state: 'uploading', message: 'Saving your backup to the Google Drive folder…' });
+  try { renderBackupStatus(await fetchJSON('/api/settings/backup/run', { method: 'POST' })); toast('Backup created successfully.'); }
+  catch (error) { renderBackupStatus({ state: 'failed', message: error.message }); toast(error.message); }
+  finally { button.disabled = false; }
+}
+installBackupSettings();
+
+$('#timer-open').onclick = () => { $('#timer-dialog').showModal(); renderFocusTimer(); renderCountdownTimer(); };
+$('#settings-open').onclick = async () => { $('#settings-dialog').showModal(); renderAlarmSetting(); await loadBackupSettings(); };
+document.querySelectorAll('[data-timer-mode]').forEach(button => button.onclick = () => {
+  document.querySelectorAll('[data-timer-mode]').forEach(item => { const active = item === button; item.classList.toggle('active', active); item.setAttribute('aria-selected', String(active)); });
+  $('#focus-timer-panel').hidden = button.dataset.timerMode !== 'focus'; $('#countdown-timer-panel').hidden = button.dataset.timerMode !== 'countdown'; $('#timer-title').textContent = button.textContent;
+});
+$('#timer-start').onclick = () => { if (!$('#timer-name').value.trim()) return toast('Name the task first.'); timerStart = Date.now(); renderFocusTimer(); };
+$('#timer-pause').onclick = () => { if (timerStart) { timerElapsed = focusSeconds(); timerStart = null; } else { timerStart = Date.now(); } renderFocusTimer(); };
+$('#timer-stop').onclick = () => { const seconds = focusSeconds(); if (!seconds) return; $('#task-name').value = $('#timer-name').value; $('#task-minutes').value = Math.max(1, Math.round(seconds / 60)); $('#task-desc').value = `Timer: ${formatTimer(seconds)}`; timerStart = null; timerElapsed = 0; renderFocusTimer(); $('#timer-dialog').close(); toast('Timer duration added to the form. Save it when ready.'); };
+['hours', 'minutes', 'seconds'].forEach(unit => $(`#countdown-${unit}`).onchange = setCountdownFromInputs);
+$('#countdown-start').onclick = () => { if (!countdownSeconds()) return toast('Set a time first.'); timerSettings.countdown.running = true; timerSettings.countdown.startedAt = Date.now(); saveTimerSettings(); renderCountdownTimer(); };
+$('#countdown-pause').onclick = () => { if (timerSettings.countdown.running) { persistCountdown(); timerSettings.countdown.running = false; timerSettings.countdown.startedAt = null; } else if (timerSettings.countdown.remaining) { timerSettings.countdown.running = true; timerSettings.countdown.startedAt = Date.now(); } saveTimerSettings(); renderCountdownTimer(); };
+$('#countdown-reset').onclick = setCountdownFromInputs;
+$('#alarm-sound-file').onchange = event => { stopPreview(); const file = event.target.files[0]; const valid = file && /\.(mp3|wav)$/i.test(file.name); $('#preview-alarm-sound').disabled = !valid; $('#save-alarm-sound').disabled = !valid; if (file && !valid) toast('Choose an MP3 or WAV audio file.'); };
+$('#preview-alarm-sound').onclick = () => { if (soundPreview) return stopPreview(); const file = $('#alarm-sound-file').files[0]; if (file) playForThirtySeconds(URL.createObjectURL(file)); };
+$('#save-alarm-sound').onclick = () => { const file = $('#alarm-sound-file').files[0]; if (!file) return; if (file.size > 3500000) return toast('Choose an audio file smaller than 3.5 MB.'); const reader = new FileReader(); reader.onload = () => { const song = { id: 'sound-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7), name: file.name, data: reader.result }; timerSettings.songs.push(song); timerSettings.selectedSoundId = song.id; try { saveTimerSettings(); } catch (_) { timerSettings.songs.pop(); timerSettings.selectedSoundId = timerSettings.songs[0]?.id || null; return toast('There is not enough browser storage for this sound.'); } $('#alarm-sound-file').value = ''; $('#preview-alarm-sound').disabled = true; $('#save-alarm-sound').disabled = true; renderAlarmSetting(); toast('Sound added and selected for the alarm.'); }; reader.readAsDataURL(file); };
+$('#alarm-song-list').onclick = event => { const preview = event.target.closest('[data-song-preview]'); const select = event.target.closest('[data-song-select]'); if (preview) { const song = timerSettings.songs.find(item => item.id === preview.dataset.songPreview); if (!song) return; if (previewSongId === song.id && soundPreview) stopPreview(); else playForThirtySeconds(song.data, song.id); } if (select) { timerSettings.selectedSoundId = select.dataset.songSelect; saveTimerSettings(); renderAlarmSetting(); toast('Alarm sound selected.'); } };
+$('#countdown-stop-alarm').onclick = stopAlarmSound;
+$('#settings-dialog').addEventListener('close', stopPreview);
+$('#timer-dialog').addEventListener('close', () => { if (timerStart) { timerElapsed = focusSeconds(); timerStart = null; } persistCountdown(); });
+timerTick = setInterval(updateTimer, 250);
+$('#countdown-hours').value = Math.floor(timerSettings.countdown.duration / 3600); $('#countdown-minutes').value = Math.floor(timerSettings.countdown.duration % 3600 / 60); $('#countdown-seconds').value = timerSettings.countdown.duration % 60;
 
 function goalHours() { const saved = Number(localStorage.getItem('progress-daily-goal') || 6); return saved > 24 ? saved / 60 : saved; }
 function intensity(hours, goal) {

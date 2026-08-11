@@ -7,6 +7,8 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 from collections import Counter
 from datetime import date, datetime, timedelta
@@ -18,6 +20,9 @@ from flask import Flask, Response, jsonify, render_template, request, send_file
 BASE_DIR = Path(__file__).resolve().parent
 DATABASE = Path(os.getenv("DATABASE_PATH", str(BASE_DIR / "progress_tracker.db"))).expanduser()
 TIMEZONE = ZoneInfo(os.getenv("TRACKER_TIMEZONE", "Asia/Kolkata"))
+BACKUP_SETTINGS_FILE = BASE_DIR / "backup_settings.json"
+BACKUP_STATUS_FILE = BASE_DIR / "backup_status.json"
+SCHEDULED_BACKUP_TASK = "ProgressTrackerAutomaticBackup"
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
@@ -63,6 +68,95 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_tasks_date ON tasks(log_date);
             CREATE INDEX IF NOT EXISTS idx_tasks_name ON tasks(name);
         """)
+
+
+def default_backup_settings() -> dict:
+    return {"folder": "", "frequency": "manual", "time": "03:00", "weekday": "SUN", "month_day": 1}
+
+
+def load_backup_settings() -> dict:
+    try:
+        saved = json.loads(BACKUP_SETTINGS_FILE.read_text(encoding="utf-8"))
+        return {**default_backup_settings(), **saved}
+    except (OSError, ValueError, TypeError):
+        return default_backup_settings()
+
+
+def save_json(path: Path, data: dict) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
+def load_backup_status() -> dict:
+    try:
+        return json.loads(BACKUP_STATUS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {"state": "not_configured"}
+
+
+def backup_status(state: str, **details: object) -> None:
+    save_json(BACKUP_STATUS_FILE, {
+        "state": state,
+        "updated_at": datetime.now(TIMEZONE).isoformat(timespec="seconds"),
+        **details,
+    })
+
+
+def run_google_drive_backup() -> dict:
+    """Write a consistent database snapshot to the Google Drive desktop folder."""
+    settings = load_backup_settings()
+    folder = str(settings.get("folder", "")).strip()
+    if not folder:
+        raise ValueError("Choose your Google Drive folder before running a backup.")
+    backup_dir = Path(folder).expanduser()
+    backup_status("uploading", message="Creating a secure database snapshot…")
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(TIMEZONE).strftime("%Y-%m-%d_%H-%M-%S-%f")
+        destination = backup_dir / f"progress-tracker-{timestamp}.db"
+        temporary = destination.with_suffix(".tmp")
+        source = sqlite3.connect(DATABASE)
+        copy = sqlite3.connect(temporary)
+        try:
+            source.backup(copy)
+        finally:
+            copy.close()
+            source.close()
+        temporary.replace(destination)
+        result = {"state": "complete", "message": "Backup saved. Google Drive will upload it in the background.",
+                  "file_name": destination.name, "size_bytes": destination.stat().st_size}
+        backup_status(**result)
+        return {**result, "updated_at": datetime.now(TIMEZONE).isoformat(timespec="seconds")}
+    except Exception as error:
+        if "temporary" in locals():
+            temporary.unlink(missing_ok=True)
+        backup_status("failed", message=str(error))
+        raise
+
+
+def task_command() -> str:
+    return f'"{sys.executable}" "{Path(__file__).resolve()}" --run-scheduled-backup'
+
+
+def configure_windows_backup_schedule(settings: dict) -> None:
+    frequency = settings["frequency"]
+    if os.name != "nt":
+        raise RuntimeError("Automatic schedules are available when this app runs on Windows.")
+    if frequency == "manual":
+        subprocess.run(["schtasks", "/delete", "/tn", SCHEDULED_BACKUP_TASK, "/f"], capture_output=True, text=True)
+        return
+    arguments = ["schtasks", "/create", "/tn", SCHEDULED_BACKUP_TASK, "/tr", task_command(), "/sc", frequency.upper(), "/st", settings["time"], "/f"]
+    if frequency == "weekly":
+        arguments.extend(["/d", settings["weekday"]])
+    elif frequency == "monthly":
+        arguments.extend(["/d", str(settings["month_day"])])
+    try:
+        completed = subprocess.run(arguments, capture_output=True, text=True)
+    except OSError as error:
+        raise RuntimeError(f"Windows could not create the backup schedule: {error}") from error
+    if completed.returncode:
+        raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "Windows could not create the backup schedule.")
 
 
 def lock_history(con: sqlite3.Connection) -> None:
@@ -170,7 +264,8 @@ def add_task():
         con.execute("INSERT INTO tasks (log_date, name, hours, description) VALUES (?, ?, ?, ?)",
                     (today().isoformat(), name, minutes / 60, description))
         con.execute("UPDATE daily_logs SET updated_at = CURRENT_TIMESTAMP WHERE log_date = ?", (today().isoformat(),))
-        return jsonify(day_payload(con, today().isoformat())), 201
+        payload = day_payload(con, today().isoformat())
+    return jsonify(payload), 201
 
 
 @app.put("/api/tasks/<int:task_id>")
@@ -193,7 +288,8 @@ def update_task(task_id: int):
             return validation_error(message, 403)
         con.execute("UPDATE tasks SET name=?, hours=?, description=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
                     (name, minutes / 60, description, task_id))
-        return jsonify(day_payload(con, task["log_date"]))
+        payload = day_payload(con, task["log_date"])
+    return jsonify(payload)
 
 
 @app.delete("/api/tasks/<int:task_id>")
@@ -206,7 +302,8 @@ def delete_task(task_id: int):
         if not allowed:
             return validation_error(message, 403)
         con.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        return jsonify(day_payload(con, task["log_date"]))
+        payload = day_payload(con, task["log_date"])
+    return jsonify(payload)
 
 
 @app.put("/api/reflection")
@@ -220,7 +317,8 @@ def reflection():
             return validation_error(message, 403)
         con.execute("UPDATE daily_logs SET reflection=?, updated_at=CURRENT_TIMESTAMP WHERE log_date=?",
                     (reflection_text, today().isoformat()))
-        return jsonify(day_payload(con, today().isoformat()))
+        payload = day_payload(con, today().isoformat())
+    return jsonify(payload)
 
 
 @app.get("/api/stats")
@@ -455,6 +553,56 @@ def backup():
     return send_file(DATABASE, as_attachment=True, download_name=f"progress-tracker-{today().isoformat()}.db")
 
 
+@app.get("/api/settings/backup")
+def get_backup_settings():
+    return jsonify({"settings": load_backup_settings(), "status": load_backup_status()})
+
+
+@app.post("/api/settings/backup")
+def update_backup_settings():
+    data = request.get_json(silent=True) or {}
+    frequency = data.get("frequency", "manual")
+    backup_time = str(data.get("time", "03:00"))
+    weekday = data.get("weekday", "SUN")
+    month_day = data.get("month_day", 1)
+    folder = str(data.get("folder", "")).strip()
+    if frequency not in {"manual", "daily", "weekly", "monthly"}:
+        return validation_error("Choose a valid backup frequency.")
+    try:
+        datetime.strptime(backup_time, "%H:%M")
+    except ValueError:
+        return validation_error("Choose a valid backup time.")
+    if weekday not in {"MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"}:
+        return validation_error("Choose a valid day of the week.")
+    try:
+        month_day = int(month_day)
+    except (TypeError, ValueError):
+        return validation_error("Choose a valid day of the month.")
+    if not 1 <= month_day <= 28:
+        return validation_error("Choose a day from 1 to 28.")
+    if frequency != "manual" and not folder:
+        return validation_error("Enter the Google Drive folder for scheduled backups.")
+    settings = {"folder": folder, "frequency": frequency, "time": backup_time, "weekday": weekday, "month_day": month_day}
+    try:
+        configure_windows_backup_schedule(settings)
+        save_json(BACKUP_SETTINGS_FILE, settings)
+        if frequency == "manual":
+            backup_status("ready" if folder else "not_configured", message="Ready for a manual backup." if folder else "Choose a Google Drive folder to begin.")
+        else:
+            backup_status("scheduled", message=f"{frequency.title()} backup scheduled for {backup_time}.")
+    except RuntimeError as error:
+        return validation_error(str(error), 500)
+    return jsonify({"settings": settings, "status": load_backup_status()})
+
+
+@app.post("/api/settings/backup/run")
+def run_backup_now():
+    try:
+        return jsonify(run_google_drive_backup())
+    except (OSError, ValueError, sqlite3.Error) as error:
+        return validation_error(f"Backup failed: {error}", 500)
+
+
 @app.post("/restore")
 def restore():
     upload = request.files.get("backup")
@@ -475,5 +623,11 @@ def restore():
 
 
 if __name__ == "__main__":
+    if "--run-scheduled-backup" in sys.argv:
+        try:
+            run_google_drive_backup()
+        except Exception:
+            sys.exit(1)
+        sys.exit(0)
     init_db()
     app.run(debug=True, host="127.0.0.1", port=5000)
