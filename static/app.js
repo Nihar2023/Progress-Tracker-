@@ -17,9 +17,12 @@ const progressCharts = new Map();
 const progressPanels = new Map();
 let analyticsPeriod = 'week';
 let analyticsOldestOffset = 0;
+let analyticsSelectedOffset = 0;
 let analyticsLoading = false;
 document.head.insertAdjacentHTML('beforeend', '<style>.analytics-summary,.analytics-insights{display:none}</style>');
 document.head.insertAdjacentHTML('beforeend', '<link rel="stylesheet" href="/static/backup-theme.css">');
+document.head.insertAdjacentHTML('beforeend', '<link rel="stylesheet" href="/static/missed-day.css">');
+document.head.insertAdjacentHTML('beforeend', '<link rel="stylesheet" href="/static/achievements.css">');
 
 const fmt = hours => {
   const totalMinutes = Math.round(Number(hours || 0) * 60);
@@ -52,10 +55,15 @@ function level(hours) {
   if (progress < 1) return 4;
   return 5;
 }
+function missedReasonLabel(reason, note = '') {
+  const labels = { busy: 'Busy', rest: 'Rest day', sick: 'Sick', travel: 'Travel', personal: 'Personal work', other: 'Other' };
+  return reason === 'other' && note ? `Other: ${note}` : (labels[reason] || '');
+}
 
 function renderTasks(day) {
   $('#today-tasks').innerHTML = day.tasks.length ? day.tasks.map(task => `<div class="task"><span class="tick">✓</span><div class="task-main"><div class="task-name">${escapeHtml(task.name)}</div>${task.description ? `<div class="task-note">${escapeHtml(task.description)}</div>` : ''}</div><span class="task-hours">${fmt(task.hours)}</span><button class="mini" onclick="editTask(${task.id})">Edit</button><button class="mini" onclick="deleteTask(${task.id})">×</button></div>`).join('') : '<p class="task-note">No tasks yet. Start with one meaningful thing.</p>';
   $('#reflection').value = day.reflection || '';
+  renderMissedDayReason(day);
 }
 async function loadToday() { renderTasks(await fetchJSON('/api/day/' + today)); }
 async function refreshTodayStat() {
@@ -85,8 +93,10 @@ async function heatmap(year = $('#heatmap-year').value || today.slice(0, 4)) {
       const calendarDate = new Date(data.year, month, number, 12);
       const key = calendarDate.toISOString().slice(0, 10);
       const dayHours = data.days[key] || 0;
+      const missed = data.missed_days[key];
       const cell = document.createElement('button');
-      cell.className = 'day'; cell.dataset.level = level(dayHours); cell.title = `${key}: ${fmt(dayHours)}`;
+      cell.className = 'day'; cell.dataset.level = level(dayHours); cell.title = missed ? `${key}: ${missedReasonLabel(missed.reason, missed.note)}` : `${key}: ${fmt(dayHours)}`;
+      if (missed && !dayHours) cell.dataset.missed = 'true';
       if (key <= data.end) {
         cell.onclick = () => showDay(key); hours += dayHours;
         if (dayHours > 0) { active += 1; streak += 1; maxStreak = Math.max(maxStreak, streak); } else streak = 0;
@@ -104,7 +114,7 @@ async function heatmap(year = $('#heatmap-year').value || today.slice(0, 4)) {
 async function showDay(logDate) {
   const day = await fetchJSON('/api/day/' + logDate);
   const title = new Date(logDate + 'T12:00:00').toLocaleDateString(undefined, { day: 'numeric', month: 'long', year: 'numeric' });
-  $('#day-detail').innerHTML = `<h2 class="day-title">${title}</h2>${day.locked ? '<p class="locked">This record is permanently locked.</p>' : ''}<p class="day-total">${fmt(day.total_hours)}</p><h3>Tasks</h3>${day.tasks.length ? day.tasks.map(task => `<div class="task"><span class="tick">✓</span><div class="task-main"><b>${escapeHtml(task.name)}</b>${task.description ? `<div class="task-note">${escapeHtml(task.description)}</div>` : ''}</div><span class="task-hours">${fmt(task.hours)}</span></div>`).join('') : '<p class="task-note">No work recorded.</p>'}<h3>Reflection</h3><p>${escapeHtml(day.reflection || 'No reflection recorded.')}</p>`;
+  $('#day-detail').innerHTML = `<h2 class="day-title">${title}</h2>${day.locked ? '<p class="locked">This record is permanently locked.</p>' : ''}<p class="day-total">${fmt(day.total_hours)}</p>${day.missed_reason ? `<div class="missed-day-detail"><b>Missed-day reason</b><span>${escapeHtml(missedReasonLabel(day.missed_reason, day.missed_reason_note))}</span></div>` : ""}<h3>Tasks</h3>${day.tasks.length ? day.tasks.map(task => `<div class="task"><span class="tick">✓</span><div class="task-main"><b>${escapeHtml(task.name)}</b>${task.description ? `<div class="task-note">${escapeHtml(task.description)}</div>` : ''}</div><span class="task-hours">${fmt(task.hours)}</span></div>`).join('') : '<p class="task-note">No work recorded.</p>'}<h3>Reflection</h3><p>${escapeHtml(day.reflection || 'No reflection recorded.')}</p>`;
   $('#day-dialog').showModal();
 }
 async function stats() {
@@ -121,7 +131,7 @@ $('#task-form').onsubmit = async event => {
     if (editing) { url += '/' + editing; method = 'PUT'; }
     const day = await fetchJSON(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: $('#task-name').value, minutes: $('#task-minutes').value, description: $('#task-desc').value }) });
     editing = null; event.target.reset(); event.target.querySelector('button').textContent = 'Add task';
-    renderTasks(day); heatmap(); stats(); refreshAnalytics(); toast('Saved immediately.');
+    renderTasks(day); heatmap(); stats(); refreshAnalytics(); loadAchievements($('#achievements-year')?.value); toast('Saved immediately.');
   } catch (error) { toast(error.message); }
 };
 window.editTask = async id => {
@@ -132,11 +142,73 @@ window.editTask = async id => {
 };
 window.deleteTask = async id => {
   if (!confirm('Delete this task?')) return;
-  try { renderTasks(await fetchJSON('/api/tasks/' + id, { method: 'DELETE' })); heatmap(); stats(); refreshAnalytics(); toast('Task deleted.'); } catch (error) { toast(error.message); }
+  try { renderTasks(await fetchJSON('/api/tasks/' + id, { method: 'DELETE' })); heatmap(); stats(); refreshAnalytics(); loadAchievements($('#achievements-year')?.value); toast('Task deleted.'); } catch (error) { toast(error.message); }
 };
 $('#save-reflection').onclick = async () => {
   try { await fetchJSON('/api/reflection', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reflection: $('#reflection').value }) }); $('#reflection-status').textContent = 'Saved immediately.'; } catch (error) { toast(error.message); }
 };
+function updateMissedDayFields() {
+  const other = $('#missed-day-reason').value === 'other';
+  $('#missed-day-other').hidden = !other;
+}
+function renderMissedDayReason(day) {
+  const section = $('#missed-day-section');
+  if (!section) return;
+  const reason = day.missed_reason || '';
+  $('#missed-day-reason').value = reason;
+  $('#missed-day-note').value = day.missed_reason_note || '';
+  $('#missed-day-clear').hidden = !reason;
+  $('#missed-day-status').textContent = reason ? missedReasonLabel(reason, day.missed_reason_note) : 'Optional';
+  updateMissedDayFields();
+}
+function mountMissedDayReason() {
+  $('#task-form').insertAdjacentHTML('afterend', `<section class="missed-day-section" id="missed-day-section"><button class="missed-day-toggle" id="missed-day-toggle" type="button" aria-expanded="false" aria-controls="missed-day-panel"><span><b>No progress today?</b><small>Optional reason</small></span><em id="missed-day-status">Optional</em><i aria-hidden="true">⌄</i></button><div class="missed-day-panel" id="missed-day-panel" hidden><p>Mark why today may not have progress. You can edit or clear this until today ends.</p><label>Reason<select id="missed-day-reason"><option value="">Choose a reason</option><option value="busy">Busy</option><option value="rest">Rest day</option><option value="sick">Sick</option><option value="travel">Travel</option><option value="personal">Personal work</option><option value="other">Other</option></select></label><div id="missed-day-other" hidden><label>Other reason<textarea id="missed-day-note" maxlength="500" placeholder="Write your reason..."></textarea></label><button class="ghost missed-day-expand" id="missed-day-expand" type="button" aria-expanded="false">Expand writing area</button></div><div class="missed-day-actions"><button class="primary" id="save-missed-day" type="button">Save reason</button><button class="ghost" id="missed-day-clear" type="button" hidden>Clear</button></div></div></section>`);
+  $('#missed-day-toggle').onclick = () => {
+    const panel = $('#missed-day-panel'); const open = panel.hidden;
+    panel.hidden = !open; $('#missed-day-toggle').setAttribute('aria-expanded', String(open));
+  };
+  $('#missed-day-reason').onchange = updateMissedDayFields;
+  $('#missed-day-expand').onclick = () => {
+    const expanded = $('#missed-day-note').classList.toggle('expanded');
+    $('#missed-day-expand').textContent = expanded ? 'Use compact writing area' : 'Expand writing area';
+    $('#missed-day-expand').setAttribute('aria-expanded', String(expanded));
+  };
+  const saveReason = async clear => {
+    try {
+      const day = await fetchJSON('/api/missed-day-reason', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: clear ? '' : $('#missed-day-reason').value, note: clear ? '' : $('#missed-day-note').value }) });
+      renderTasks(day); heatmap(); toast(clear ? 'Missed-day reason cleared.' : 'Missed-day reason saved.');
+    } catch (error) { toast(error.message); }
+  };
+  $('#save-missed-day').onclick = () => saveReason(false);
+  $('#missed-day-clear').onclick = () => saveReason(true);
+}
+function achievementDate(value) {
+  return new Date(value + 'T12:00:00').toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+}
+function renderAchievements(data) {
+  const picker = $('#achievements-year');
+  if (!picker.options.length) picker.innerHTML = data.available_years.map(year => `<option value="${year}">${year}</option>`).join('');
+  picker.value = data.year;
+  const unlocked = data.badges.filter(badge => badge.unlocked);
+  const next = data.badges.find(badge => !badge.unlocked);
+  $('#achievements-count').textContent = `${unlocked.length} / ${data.badges.length} unlocked`;
+  $('#achievements-streak').textContent = `${data.longest_streak}-day best streak`;
+  $('#achievements-next').textContent = next ? `Next: ${next.days}-day badge — ${next.remaining} day${next.remaining === 1 ? '' : 's'} remaining` : 'Every badge unlocked — incredible work!';
+  $('#achievements-grid').innerHTML = data.badges.map(badge => `<article class="achievement-badge${badge.unlocked ? ' earned' : ' locked'}"><div class="achievement-image"><img src="${badge.image}" alt="${badge.days}-day streak badge" loading="lazy">${badge.unlocked ? '<span class="achievement-earned">Unlocked</span>' : '<span class="achievement-lock" aria-label="Locked">🔒</span>'}</div><div class="achievement-meta"><strong>${badge.days}-day streak</strong><span>${badge.unlocked ? `Unlocked — ${achievementDate(badge.unlocked_on)}` : `${badge.remaining} day${badge.remaining === 1 ? '' : 's'} remaining`}</span></div></article>`).join('');
+}
+async function loadAchievements(year) {
+  const grid = $('#achievements-grid');
+  if (!grid) return;
+  grid.innerHTML = '<p class="achievements-loading">Loading achievements…</p>';
+  try { renderAchievements(await fetchJSON('/api/achievements' + (year ? `?year=${year}` : ''))); }
+  catch (error) { grid.innerHTML = `<p class="achievements-loading">${escapeHtml(error.message)}</p>`; }
+}
+function mountAchievements() {
+  $('#stats').insertAdjacentHTML('afterend', `<section class="card achievements-card" aria-labelledby="achievements-title"><div class="achievements-icon" aria-hidden="true">🏆</div><div class="achievements-copy"><span class="eyebrow">ACHIEVEMENTS</span><h2 id="achievements-title">Streak badges</h2><p id="achievements-count">0 / 8 unlocked</p><small id="achievements-next">Loading achievements…</small></div><div class="achievements-actions"><b id="achievements-streak">0-day best streak</b><button id="view-achievements" class="ghost" type="button">View collection</button></div></section><dialog id="achievements-dialog" class="achievements-dialog" aria-labelledby="achievements-dialog-title"><button class="close" aria-label="Close achievements" onclick="this.closest('dialog').close()">×</button><div class="achievements-dialog-header"><div><span class="eyebrow">ACHIEVEMENTS</span><h2 id="achievements-dialog-title">Streak badge collection</h2><p>Earned badges remain in their calendar year.</p></div><label>Year<select id="achievements-year" aria-label="Select achievements year"></select></label></div><div id="achievements-grid" class="achievements-grid" aria-live="polite"></div></dialog>`);
+  $('#achievements-year').onchange = event => loadAchievements(event.target.value);
+  $('#view-achievements').onclick = () => $('#achievements-dialog').showModal();
+  loadAchievements();
+}
 let searchWait;
 $('#search').oninput = event => {
   clearTimeout(searchWait);
@@ -460,6 +532,29 @@ function makePanel(data) {
   return panel;
 }
 async function fetchProgress(offset) { return fetchJSON(`/api/progress?period=${analyticsPeriod}&offset=${offset}`); }
+function renderAnalyticsPeriodMenu(periods) {
+  const menu = $('#analytics-period-menu');
+  const button = $('#analytics-period-dropdown');
+  if (!menu || !button) return;
+  menu.innerHTML = periods.map(item => `<button type="button" class="analytics-period-option${item.offset === analyticsSelectedOffset ? ' active' : ''}" data-analytics-offset="${item.offset}" role="option" aria-selected="${item.offset === analyticsSelectedOffset}">${escapeHtml(item.title)}</button>`).join('');
+  button.querySelector('span').textContent = periods.find(item => item.offset === analyticsSelectedOffset)?.title || 'Select period';
+}
+function setAnalyticsPeriodMenu(open) {
+  const button = $('#analytics-period-dropdown');
+  const menu = $('#analytics-period-menu');
+  button.setAttribute('aria-expanded', String(open)); menu.hidden = !open;
+}
+async function showAnalyticsPeriod(offset) {
+  analyticsSelectedOffset = Number(offset);
+  const strip = $('#analytics-strip');
+  progressCharts.forEach(chart => chart.destroy()); progressCharts.clear(); progressPanels.clear();
+  renderAnalyticsPeriodMenu(Array.from($('#analytics-period-menu').querySelectorAll('[data-analytics-offset]')).map(option => ({ offset: Number(option.dataset.analyticsOffset), title: option.textContent })));
+  strip.innerHTML = '<div class="analytics-loading" aria-live="polite">Loading analytics…</div>';
+  try {
+    const data = await fetchProgress(analyticsSelectedOffset);
+    updateAnalyticsSummary(data); strip.innerHTML = ''; strip.append(makePanel(data));
+  } catch (error) { strip.innerHTML = `<p class="progress-empty">${escapeHtml(error.message)}</p>`; }
+}
 async function addOlderPanel() {
   if (analyticsLoading) return;
   const current = progressPanels.get(analyticsOldestOffset);
@@ -476,25 +571,19 @@ async function addOlderPanel() {
   } catch (error) { toast(error.message); } finally { analyticsLoading = false; }
 }
 async function loadAnalytics(period = analyticsPeriod) {
-  analyticsPeriod = period; analyticsOldestOffset = 0; analyticsLoading = true;
+  analyticsPeriod = period; analyticsOldestOffset = 0; analyticsSelectedOffset = 0; analyticsLoading = true;
   progressCharts.forEach(chart => chart.destroy()); progressCharts.clear(); progressPanels.clear();
   const strip = $('#analytics-strip'); strip.innerHTML = '<div class="analytics-loading" aria-live="polite">Loading analytics…</div>';
   try {
-    const current = await fetchProgress(0);
-    updateAnalyticsSummary(current); strip.innerHTML = '';
-    const preload = [];
-    if (current.has_more) preload.push(fetchProgress(1));
-    const older = await Promise.all(preload);
-    older.reverse().forEach(data => strip.append(makePanel(data)));
-    strip.append(makePanel(current));
-    analyticsOldestOffset = older.length;
-    requestAnimationFrame(() => { strip.scrollLeft = strip.scrollWidth; });
+    const periods = await fetchJSON(`/api/progress/periods?period=${analyticsPeriod}`);
+    renderAnalyticsPeriodMenu(periods.periods);
+    await showAnalyticsPeriod(0);
   } catch (error) { strip.innerHTML = `<p class="progress-empty">${escapeHtml(error.message)}</p>`; } finally { analyticsLoading = false; }
 }
 function refreshAnalytics() { loadAnalytics(analyticsPeriod); }
 function mountAnalytics() {
   const anchor = $('#stats');
-  anchor.insertAdjacentHTML('afterend', `<section class="card progress-card" aria-labelledby="progress-title"><div class="progress-header"><div><span class="eyebrow">ANALYTICS</span><h2 id="progress-title">Progress overview</h2><p>Real time spent, across every recorded period.</p></div><div class="analytics-actions"><label class="goal-control">Daily goal <input id="daily-goal" type="number" min=".25" max="24" step=".25" aria-label="Daily hours target"></label><button class="ghost export-period" id="export-period">Export CSV</button></div></div><div class="period-control" role="tablist" aria-label="Select analytics period"><button data-period="week" class="active" role="tab" aria-selected="true">Week</button><button data-period="month" role="tab" aria-selected="false">Month</button><button data-period="year" role="tab" aria-selected="false">Year</button></div><section id="analytics-summary" class="analytics-summary" aria-live="polite"></section><div id="analytics-insights" class="analytics-insights" aria-label="Productivity highlights"></div><div class="analytics-scroll-wrap"><div class="scroll-cue">Swipe or scroll left for older periods</div><div id="analytics-strip" class="analytics-strip" tabindex="0" aria-label="Analytics periods, newest on the right"></div></div></section>`);
+  anchor.insertAdjacentHTML('afterend', `<section class="card progress-card" aria-labelledby="progress-title"><div class="progress-header"><div><span class="eyebrow">ANALYTICS</span><h2 id="progress-title">Progress overview</h2><p>Real time spent, across every recorded period.</p></div><div class="analytics-actions"><label class="goal-control">Daily goal <input id="daily-goal" type="number" min=".25" max="24" step=".25" aria-label="Daily hours target"></label><button class="ghost export-period" id="export-period">Export CSV</button></div></div><div class="analytics-period-controls"><div class="period-control" role="tablist" aria-label="Select analytics period"><button data-period="week" class="active" role="tab" aria-selected="true">Week</button><button data-period="month" role="tab" aria-selected="false">Month</button><button data-period="year" role="tab" aria-selected="false">Year</button></div><div class="analytics-period-picker"><span>View period</span><div class="analytics-period-dropdown"><button id="analytics-period-dropdown" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="analytics-period-menu"><span>Current period</span><i aria-hidden="true">⌄</i></button><div id="analytics-period-menu" class="analytics-period-menu" role="listbox" hidden></div></div></div></div><section id="analytics-summary" class="analytics-summary" aria-live="polite"></section><div id="analytics-insights" class="analytics-insights" aria-label="Productivity highlights"></div><div class="analytics-scroll-wrap"><div id="analytics-strip" class="analytics-strip" tabindex="0" aria-label="Selected analytics period"></div></div></section>`);
   $('#daily-goal').value = goalHours();
   $('#analytics-summary').remove(); $('#analytics-insights').remove();
   $('#daily-goal').onchange = event => { const value = Math.min(24, Math.max(.25, Number(event.target.value) || 6)); localStorage.setItem('progress-daily-goal', value); event.target.value = value; heatmap(); refreshAnalytics(); };
@@ -502,11 +591,15 @@ function mountAnalytics() {
     document.querySelectorAll('[data-period]').forEach(item => { const selected = item === button; item.classList.toggle('active', selected); item.setAttribute('aria-selected', selected); });
     loadAnalytics(button.dataset.period);
   });
-  const strip = $('#analytics-strip');
-  strip.addEventListener('scroll', () => { if (strip.scrollLeft < 110) addOlderPanel(); }, { passive: true });
-  strip.addEventListener('keydown', event => { if (event.key === 'ArrowLeft') strip.scrollBy({ left: -320, behavior: 'smooth' }); if (event.key === 'ArrowRight') strip.scrollBy({ left: 320, behavior: 'smooth' }); });
+  $('#analytics-period-dropdown').onclick = () => setAnalyticsPeriodMenu($('#analytics-period-menu').hidden);
+  $('#analytics-period-menu').onclick = event => {
+    const option = event.target.closest('[data-analytics-offset]'); if (!option) return;
+    setAnalyticsPeriodMenu(false); showAnalyticsPeriod(option.dataset.analyticsOffset);
+  };
+  document.addEventListener('click', event => { if (!event.target.closest('.analytics-period-dropdown')) setAnalyticsPeriodMenu(false); });
+  document.addEventListener('keydown', event => { if (event.key === 'Escape') setAnalyticsPeriodMenu(false); });
   $('#export-period').onclick = () => {
-    const current = progressPanels.get(0)?.data;
+    const current = progressPanels.get(analyticsSelectedOffset)?.data;
     if (!current) return;
     const rows = [['Date', 'Hours', 'Sessions'], ...current.points.filter(point => !point.is_future).map(point => [point.date, point.hours, point.sessions])];
     const blob = new Blob([rows.map(row => row.join(',')).join('\n')], { type: 'text/csv' });
@@ -518,7 +611,9 @@ function mountAnalytics() {
 
 $('#heatmap-year').onchange = event => heatmap(event.target.value);
 $('#today-label').textContent = new Date(today + 'T12:00:00').toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+mountMissedDayReason();
 mountAnalytics();
+mountAchievements();
 Promise.all([loadToday(), heatmap(), stats()]).catch(error => toast(error.message));
 
 async function stats() {
@@ -535,7 +630,7 @@ $('#report-button').onclick = async () => {
 
 $('#daily-goal').min = '.25'; $('#daily-goal').max = '24'; $('#daily-goal').step = '.25'; $('#daily-goal').setAttribute('aria-label', 'Daily hours target');
 $('#export-period').onclick = () => {
-  const current = progressPanels.get(0)?.data;
+  const current = progressPanels.get(analyticsSelectedOffset)?.data;
   if (!current) return;
   const rows = [['Date', 'Hours', 'Sessions'], ...current.points.filter(point => !point.is_future).map(point => [point.date, point.hours, point.sessions])];
   const blob = new Blob([rows.map(row => row.join(',')).join('\n')], { type: 'text/csv' });

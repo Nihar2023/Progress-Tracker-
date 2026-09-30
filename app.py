@@ -15,7 +15,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from flask import Flask, Response, jsonify, render_template, request, send_file
+from flask import Flask, Response, jsonify, render_template, request, send_file, send_from_directory
 
 BASE_DIR = Path(__file__).resolve().parent
 DATABASE = Path(os.getenv("DATABASE_PATH", str(BASE_DIR / "progress_tracker.db"))).expanduser()
@@ -51,6 +51,8 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS daily_logs (
                 log_date TEXT PRIMARY KEY,
                 reflection TEXT NOT NULL DEFAULT '',
+                missed_reason TEXT NOT NULL DEFAULT '',
+                missed_reason_note TEXT NOT NULL DEFAULT '',
                 locked INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -67,7 +69,24 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_tasks_date ON tasks(log_date);
             CREATE INDEX IF NOT EXISTS idx_tasks_name ON tasks(name);
+            CREATE TABLE IF NOT EXISTS earned_badges (
+                badge_id TEXT PRIMARY KEY,
+                milestone_days INTEGER NOT NULL,
+                badge_year INTEGER NOT NULL,
+                badge_version TEXT NOT NULL DEFAULT 'v1',
+                unlocked_on TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(milestone_days, badge_year)
+            );
         """)
+        columns = {row["name"] for row in con.execute("PRAGMA table_info(daily_logs)")}
+        if "missed_reason" not in columns:
+            con.execute("ALTER TABLE daily_logs ADD COLUMN missed_reason TEXT NOT NULL DEFAULT ''")
+        if "missed_reason_note" not in columns:
+            con.execute("ALTER TABLE daily_logs ADD COLUMN missed_reason_note TEXT NOT NULL DEFAULT ''")
+        badge_columns = {row["name"] for row in con.execute("PRAGMA table_info(earned_badges)")}
+        if "badge_version" not in badge_columns:
+            con.execute("ALTER TABLE earned_badges ADD COLUMN badge_version TEXT NOT NULL DEFAULT 'v1'")
 
 
 def default_backup_settings() -> dict:
@@ -183,6 +202,8 @@ def day_payload(con: sqlite3.Connection, log_date: str) -> dict:
     return {
         "date": log_date,
         "reflection": log["reflection"] if log else "",
+        "missed_reason": log["missed_reason"] if log else "",
+        "missed_reason_note": log["missed_reason_note"] if log else "",
         "locked": bool(log["locked"]) if log else log_date < today().isoformat(),
         "total_hours": round(sum(task["hours"] for task in tasks), 2),
         "total_minutes": minutes_from_hours(sum(task["hours"] for task in tasks)),
@@ -203,9 +224,44 @@ def validation_error(message: str, status: int = 400):
     return jsonify({"error": message}), status
 
 
+BADGE_MILESTONES = (30, 60, 90, 120, 180, 240, 300, 365)
+CURRENT_BADGE_VERSION = "v1"
+
+
+def record_earned_badges(con: sqlite3.Connection, badge_year: int) -> tuple[int, dict[int, dict[str, object]]]:
+    """Persist every completed calendar-year streak badge, without revoking awards."""
+    rows = con.execute("""
+        SELECT log_date FROM tasks WHERE log_date BETWEEN ? AND ?
+        GROUP BY log_date ORDER BY log_date
+    """, (f"{badge_year}-01-01", f"{badge_year}-12-31")).fetchall()
+    streak = longest_streak = 0
+    previous = None
+    newly_unlocked: dict[int, date] = {}
+    for row in rows:
+        active_day = date.fromisoformat(row["log_date"])
+        streak = streak + 1 if previous and active_day == previous + timedelta(days=1) else 1
+        longest_streak = max(longest_streak, streak)
+        previous = active_day
+        if streak in BADGE_MILESTONES:
+            newly_unlocked.setdefault(streak, active_day)
+    for milestone, unlocked_on in newly_unlocked.items():
+        con.execute("""
+            INSERT OR IGNORE INTO earned_badges (badge_id, milestone_days, badge_year, badge_version, unlocked_on)
+            VALUES (?, ?, ?, ?, ?)
+        """, (f"{milestone}-day-badge-{badge_year}", milestone, badge_year, CURRENT_BADGE_VERSION, unlocked_on.isoformat()))
+    stored = {row["milestone_days"]: {"unlocked_on": date.fromisoformat(row["unlocked_on"]), "version": row["badge_version"]}
+              for row in con.execute("SELECT milestone_days, badge_version, unlocked_on FROM earned_badges WHERE badge_year=?", (badge_year,))}
+    return longest_streak, stored
+
+
 @app.get("/")
 def index():
     return render_template("index.html", today=today().isoformat(), timezone=str(TIMEZONE))
+
+
+@app.get("/badges/<path:filename>")
+def badge_image(filename: str):
+    return send_from_directory(BASE_DIR / "Badges", filename)
 
 
 @app.get("/api/heatmap")
@@ -217,7 +273,7 @@ def heatmap():
     end = min(date(requested_year, 12, 31), today())
     with connection() as con:
         rows = con.execute("""
-            SELECT d.log_date, COALESCE(SUM(t.hours), 0) AS hours
+            SELECT d.log_date, d.missed_reason, d.missed_reason_note, COALESCE(SUM(t.hours), 0) AS hours
             FROM daily_logs d LEFT JOIN tasks t ON d.log_date = t.log_date
             WHERE d.log_date BETWEEN ? AND ? GROUP BY d.log_date
         """, (start.isoformat(), end.isoformat())).fetchall()
@@ -226,8 +282,10 @@ def heatmap():
             UNION SELECT ? AS year ORDER BY year DESC
         """, (str(today().year),)).fetchall()]
     totals = {row["log_date"]: round(row["hours"], 2) for row in rows}
+    missed_days = {row["log_date"]: {"reason": row["missed_reason"], "note": row["missed_reason_note"]}
+                   for row in rows if row["missed_reason"]}
     return jsonify({"year": requested_year, "start": start.isoformat(), "end": end.isoformat(),
-                    "days": totals, "available_years": available})
+                    "days": totals, "missed_days": missed_days, "available_years": available})
 
 
 @app.get("/api/day/<log_date>")
@@ -263,6 +321,7 @@ def add_task():
             return validation_error(message, 403)
         con.execute("INSERT INTO tasks (log_date, name, hours, description) VALUES (?, ?, ?, ?)",
                     (today().isoformat(), name, minutes / 60, description))
+        record_earned_badges(con, today().year)
         con.execute("UPDATE daily_logs SET updated_at = CURRENT_TIMESTAMP WHERE log_date = ?", (today().isoformat(),))
         payload = day_payload(con, today().isoformat())
     return jsonify(payload), 201
@@ -321,6 +380,30 @@ def reflection():
     return jsonify(payload)
 
 
+@app.put("/api/missed-day-reason")
+def missed_day_reason():
+    data = request.get_json(silent=True) or {}
+    reason = str(data.get("reason", "")).strip().lower()
+    note = str(data.get("note", "")).strip()
+    valid_reasons = {"", "busy", "rest", "sick", "travel", "personal", "other"}
+    if reason not in valid_reasons:
+        return validation_error("Choose a valid missed-day reason.")
+    if len(note) > 500:
+        return validation_error("Your custom reason must be 500 characters or fewer.")
+    if reason == "other" and not note:
+        return validation_error("Add a custom reason before saving.")
+    if reason != "other":
+        note = ""
+    with connection() as con:
+        allowed, message = editable(con, today().isoformat())
+        if not allowed:
+            return validation_error(message, 403)
+        con.execute("UPDATE daily_logs SET missed_reason=?, missed_reason_note=?, updated_at=CURRENT_TIMESTAMP WHERE log_date=?",
+                    (reason, note, today().isoformat()))
+        payload = day_payload(con, today().isoformat())
+    return jsonify(payload)
+
+
 @app.get("/api/stats")
 def stats():
     with connection() as con:
@@ -339,7 +422,9 @@ def stats():
         longest = max(longest, run)
         prev = item[0]
     dates = {item[0] for item in totals}
-    cursor = today()
+    # A streak remains active throughout today, even before today's first task.
+    # It only breaks once a full prior day has no recorded work.
+    cursor = today() if today() in dates else today() - timedelta(days=1)
     while cursor in dates:
         current += 1
         cursor -= timedelta(days=1)
@@ -352,6 +437,37 @@ def stats():
         "average_hours": round(total_hours / len(totals), 2) if totals else 0, "total_tasks": total_tasks,
         "productive_day": {"date": best_day[0].isoformat(), "hours": round(best_day[1], 2)} if best_day else None,
         "productive_month": {"month": best_month[0], "hours": round(best_month[1], 2)} if best_month else None})
+
+
+@app.get("/api/achievements")
+def achievements():
+    """Return calendar-year streak badges in the same collection style as LeetCode."""
+    requested_year = request.args.get("year", type=int) or today().year
+    if not 2000 <= requested_year <= today().year:
+        return validation_error("Choose a valid achievements year.")
+    with connection() as con:
+        longest_streak, unlocks = record_earned_badges(con, requested_year)
+        years = [int(row["year"]) for row in con.execute("""
+            SELECT DISTINCT substr(log_date, 1, 4) AS year FROM tasks
+            UNION SELECT ? AS year ORDER BY year DESC
+        """, (str(today().year),)).fetchall()]
+
+    next_milestone = next((milestone for milestone in BADGE_MILESTONES if milestone not in unlocks), None)
+    return jsonify({
+        "year": requested_year,
+        "available_years": years,
+        "longest_streak": longest_streak,
+        "next_milestone": next_milestone,
+        "badges": [{
+            "days": milestone,
+            "image": f"/badges/{milestone}-days-{unlocks.get(milestone, {}).get('version', CURRENT_BADGE_VERSION)}.png",
+            "unlocked": milestone in unlocks,
+            "unlocked_on": unlocks[milestone]["unlocked_on"].isoformat() if milestone in unlocks else None,
+            "remaining": max(0, milestone - longest_streak),
+            "badge_id": f"{milestone}-day-badge-{requested_year}",
+            "badge_version": unlocks.get(milestone, {}).get("version", CURRENT_BADGE_VERSION),
+        } for milestone in BADGE_MILESTONES],
+    })
 
 
 @app.get("/api/progress")
@@ -474,6 +590,41 @@ def progress():
                      "productive_weekday": calendar.day_name[productive_weekday] if productive_weekday is not None else None,
                      "achievements": achievements}
     })
+
+
+@app.get("/api/progress/periods")
+def progress_periods():
+    """List analytics periods using the same titles shown above each chart."""
+    period = request.args.get("period", "week")
+    if period not in {"week", "month", "year"}:
+        return validation_error("Choose week, month, or year.")
+
+    current = today()
+    with connection() as con:
+        first_row = con.execute("SELECT MIN(log_date) AS first_date FROM tasks").fetchone()
+    first_date = date.fromisoformat(first_row["first_date"]) if first_row["first_date"] else current
+
+    if period == "week":
+        current_start = current - timedelta(days=current.weekday())
+        first_start = first_date - timedelta(days=first_date.weekday())
+        oldest_offset = (current_start - first_start).days // 7
+        periods = []
+        for offset in range(oldest_offset + 1):
+            start = current_start - timedelta(days=7 * offset)
+            end = start + timedelta(days=6)
+            periods.append({"offset": offset, "title": f"{start.strftime('%d %b')} – {end.strftime('%d %b %Y')}"})
+    elif period == "month":
+        oldest_offset = (current.year - first_date.year) * 12 + current.month - first_date.month
+        periods = []
+        for offset in range(oldest_offset + 1):
+            index = current.year * 12 + current.month - 1 - offset
+            start = date(index // 12, index % 12 + 1, 1)
+            periods.append({"offset": offset, "title": start.strftime("%B %Y")})
+    else:
+        periods = [{"offset": offset, "title": str(current.year - offset)}
+                   for offset in range(current.year - first_date.year + 1)]
+
+    return jsonify({"period": period, "periods": periods})
 
 
 @app.get("/api/search")

@@ -1,0 +1,68 @@
+/* Narrow-screen layout refinements. Loaded last so the desktop design remains unchanged. */
+@media (max-width: 640px) {
+  body { font-size: 15px; overflow-x: hidden; }
+
+  header, main { width: 100%; }
+  header { align-items: flex-start; padding: 22px 16px 18px; }
+  main { padding: 0 12px 32px; }
+  h1 { font-size: 28px; line-height: 1.05; max-width: 250px; }
+  .eyebrow { font-size: 10px; }
+  .header-actions { gap: 0; }
+  .header-actions .today { display: none; }
+  .settings-button { min-width: 44px; min-height: 44px; padding: 10px; }
+
+  .card { border-radius: 12px; padding: 17px 15px; }
+  .heat-card { padding: 16px 0 18px !important; }
+  .heat-header { gap: 13px; margin: 0 15px 16px; }
+  .heat-header h2 { font-size: 15px; line-height: 1.35; }
+  .heat-header h2 strong { display: block; font-size: 27px; line-height: 1; margin-bottom: 3px; }
+  .heat-summary { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; width: 100%; font-size: 12px; }
+  .year-picker { grid-column: 1 / -1; justify-content: space-between; width: 100%; }
+  .year-picker select { min-height: 40px; }
+  .month-graphs { display: flex; justify-content: flex-start; gap: 16px; overflow-x: auto; padding: 0 15px 8px; scroll-snap-type: x proximity; scrollbar-width: thin; }
+  .month-graph { scroll-snap-align: start; }
+  .month-graph h3 { font-size: 13px; }
+
+  .stats { gap: 8px; margin-bottom: 12px; }
+  .stat { min-height: 86px; padding: 13px 11px; }
+  .stat b { font-size: 23px; }
+  .stat span { font-size: 11px; line-height: 1.25; }
+  .grid { gap: 12px; margin-bottom: 12px; }
+  .section-head { gap: 10px; }
+  .section-head h2, .card h2 { font-size: 17px; }
+  .section-head p, .card > p { font-size: 13px; line-height: 1.45; margin-bottom: 15px; }
+  .section-head .ghost { align-self: stretch; }
+
+  label { font-size: 12px; margin-bottom: 12px; }
+  input, textarea { font-size: 16px; min-height: 45px; padding: 11px 12px; }
+  textarea { min-height: 128px; }
+  .primary, .ghost, .tool-actions a, .restore { min-height: 44px; padding: 11px 14px; }
+  #task-form .primary, #save-reflection { width: 100%; }
+  .task { gap: 8px; padding: 13px 0; }
+  .task-hours { font-size: 13px; }
+  .mini { min-width: 36px; min-height: 36px; }
+
+  .report-controls { align-items: stretch; flex-direction: column; }
+  .report-controls .ghost { width: 100%; }
+  .report { gap: 8px; }
+  .report div { padding: 10px; }
+  .tools { gap: 14px; }
+  .tool-actions { gap: 8px; width: 100%; }
+  .tool-actions a, .restore { flex: 1 1 calc(50% - 4px); text-align: center; }
+
+  dialog { width: calc(100vw - 24px); max-width: none; max-height: calc(100dvh - 24px); overflow-y: auto; padding: 22px 17px; }
+  .close { min-width: 40px; min-height: 40px; margin: -8px -8px 0 0; }
+  .timer-mode-tabs, .settings-tabs { margin-left: -17px; margin-right: -17px; padding-left: 17px; padding-right: 17px; overflow-x: auto; }
+  .timer-buttons { flex-wrap: wrap; gap: 8px; }
+  .timer-buttons button { flex: 1 1 calc(50% - 4px); }
+  #timer-display, #countdown-display { font-size: 37px; }
+  .countdown-inputs { gap: 7px; }
+  #toast { bottom: 16px; max-width: calc(100vw - 28px); text-align: center; }
+}
+
+@media (max-width: 360px) {
+  .stats { grid-template-columns: 1fr; }
+  .tool-actions a, .restore { flex-basis: 100%; }
+  .countdown-inputs { grid-template-columns: 1fr; }
+  .timer-buttons button { flex-basis: 100%; }
+}
